@@ -26,12 +26,19 @@ Options:
   --shallow                  Shallow clone new repos (git clone --depth 1)
   --parallel N               Clone/update in parallel (best effort). Default: 1
   --update                   If repo already exists, run: git -C repo pull --ff-only
+  --export-list FILE         Write an editable repo list (TSV) and exit.
+                             Format: owner/name<TAB>clone_url
+  --from-list FILE           Clone/update only repos listed in FILE (TSV or one owner/name per line).
+                             Lines starting with # and blank lines are ignored.
   --dry-run                  Print actions without executing.
   -h, --help                 Show this help.
 
 Examples:
   ./checkout_all_github_repos.sh --dest ~/code --owner my-org --protocol https --update --parallel 6
   ./checkout_all_github_repos.sh --dest /mnt/repos --visibility private --include-forks
+  ./checkout_all_github_repos.sh --dest ~/code --owner my-org --export-list repos.tsv
+  $EDITOR repos.tsv
+  ./checkout_all_github_repos.sh --dest ~/code --from-list repos.tsv --update --parallel 6
 EOF
 }
 
@@ -44,6 +51,8 @@ INCLUDE_ARCHIVED="false"
 SHALLOW="false"
 PARALLEL="1"
 UPDATE_EXISTING="false"
+EXPORT_LIST=""
+FROM_LIST=""
 DRY_RUN="false"
 
 fail() {
@@ -77,6 +86,8 @@ while [[ $# -gt 0 ]]; do
     --shallow) SHALLOW="true"; shift ;;
     --parallel) PARALLEL="${2:-}"; shift 2 ;;
     --update) UPDATE_EXISTING="true"; shift ;;
+    --export-list) EXPORT_LIST="${2:-}"; shift 2 ;;
+    --from-list) FROM_LIST="${2:-}"; shift 2 ;;
     --dry-run) DRY_RUN="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) fail "Unknown argument: $1 (use --help)" ;;
@@ -88,6 +99,9 @@ done
 [[ "$VISIBILITY" == "all" || "$VISIBILITY" == "public" || "$VISIBILITY" == "private" ]] || fail "--visibility must be all|public|private"
 [[ "$PARALLEL" =~ ^[0-9]+$ ]] || fail "--parallel must be a positive integer"
 [[ "$PARALLEL" -ge 1 ]] || fail "--parallel must be >= 1"
+if [[ -n "$EXPORT_LIST" && -n "$FROM_LIST" ]]; then
+  fail "Use only one of --export-list or --from-list"
+fi
 
 need_cmd gh
 need_cmd git
@@ -108,10 +122,9 @@ TMP_JSON="$(mktemp)"
 cleanup() { rm -f "$TMP_JSON"; }
 trap cleanup EXIT
 
-# Pull all repos for owner (user or org), then filter locally.
-run gh repo list "$OWNER" --limit 100000 --json nameWithOwner,sshUrl,cloneUrl,isFork,isArchived,isPrivate --jq '.' >"$TMP_JSON"
-
-readarray -t LINES < <(
+get_filtered_repo_lines() {
+  # Pull all repos for owner (user or org), then filter locally.
+  run gh repo list "$OWNER" --limit 100000 --json nameWithOwner,sshUrl,cloneUrl,isFork,isArchived,isPrivate --jq '.' >"$TMP_JSON"
   python3 - "$PROTOCOL" "$VISIBILITY" "$INCLUDE_FORKS" "$INCLUDE_ARCHIVED" <"$TMP_JSON" <<'PY'
 import json, sys
 
@@ -135,10 +148,70 @@ for r in repos:
     if url and name:
         print(f"{name}\t{url}")
 PY
-)
+}
+
+resolve_url_for_name() {
+  local name="$1"
+  if [[ "$PROTOCOL" == "ssh" ]]; then
+    gh api "repos/$name" --jq '.ssh_url'
+  else
+    gh api "repos/$name" --jq '.clone_url'
+  fi
+}
+
+read_repo_lines_from_file() {
+  local file="$1"
+  [[ -f "$file" ]] || fail "--from-list file not found: $file"
+  python3 - "$file" <<'PY'
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    for raw in f:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Preserve tabs if present; otherwise keep as-is
+        print(line)
+PY
+}
+
+if [[ -n "$EXPORT_LIST" ]]; then
+  if [[ -e "$EXPORT_LIST" && ! -f "$EXPORT_LIST" ]]; then
+    fail "--export-list path exists and is not a file: $EXPORT_LIST"
+  fi
+  readarray -t LINES < <(get_filtered_repo_lines)
+  if [[ "${#LINES[@]}" -eq 0 ]]; then
+    echo "No repositories matched the selected filters for owner '$OWNER'."
+    exit 0
+  fi
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[dry-run] Would write ${#LINES[@]} repos to: $EXPORT_LIST"
+    exit 0
+  fi
+  mkdir -p "$(dirname "$EXPORT_LIST")"
+  {
+    echo "# Repo list (editable). One per line."
+    echo "# Format: owner/name<TAB>clone_url"
+    echo "# You can also delete the URL column and leave just owner/name (script will resolve URL at runtime)."
+    printf '%s\n' "${LINES[@]}"
+  } >"$EXPORT_LIST"
+  echo "Wrote repo list: $EXPORT_LIST"
+  exit 0
+fi
+
+if [[ -n "$FROM_LIST" ]]; then
+  readarray -t LINES < <(read_repo_lines_from_file "$FROM_LIST")
+else
+  readarray -t LINES < <(get_filtered_repo_lines)
+fi
 
 if [[ "${#LINES[@]}" -eq 0 ]]; then
-  echo "No repositories matched the selected filters for owner '$OWNER'."
+  if [[ -n "$FROM_LIST" ]]; then
+    echo "No repositories found in list file: $FROM_LIST"
+  else
+    echo "No repositories matched the selected filters for owner '$OWNER'."
+  fi
   exit 0
 fi
 
@@ -179,8 +252,13 @@ export DEST UPDATE_EXISTING SHALLOW DRY_RUN
 
 if [[ "$PARALLEL" -eq 1 ]]; then
   for line in "${LINES[@]}"; do
-    name="${line%%$'\t'*}"
-    url="${line#*$'\t'}"
+    if [[ "$line" == *$'\t'* ]]; then
+      name="${line%%$'\t'*}"
+      url="${line#*$'\t'}"
+    else
+      name="$line"
+      url="$(resolve_url_for_name "$name")"
+    fi
     do_one "$name" "$url"
   done
 else
@@ -189,8 +267,13 @@ else
   printf '%s\n' "${LINES[@]}" | xargs -P "$PARALLEL" -n 1 -I '{}' bash -lc '
     set -euo pipefail
     line="$1"
-    name="${line%%$'\''\t'\''*}"
-    url="${line#*$'\''\t'\''}"
+    if [[ "$line" == *$'\''\t'\''* ]]; then
+      name="${line%%$'\''\t'\''*}"
+      url="${line#*$'\''\t'\''}"
+    else
+      name="$line"
+      url="$(resolve_url_for_name "$name")"
+    fi
     do_one "$name" "$url"
   ' _ '{}'
 fi

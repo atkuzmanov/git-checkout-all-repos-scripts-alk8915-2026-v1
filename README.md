@@ -22,6 +22,27 @@ Make it executable:
 chmod +x checkout_all_github_repos.sh
 ```
 
+## Two-phase workflow (export list → curate → checkout)
+
+Export a repo list (editable) for a user/org:
+
+```bash
+./checkout_all_github_repos.sh --dest ~/code --owner my-org-or-username --export-list repos.tsv
+```
+
+Edit `repos.tsv` (delete lines you don’t want). Then checkout only those repos:
+
+```bash
+./checkout_all_github_repos.sh --dest ~/code --from-list repos.tsv --update --parallel 6
+```
+
+Notes on the list format:
+
+- Lines starting with `#` and blank lines are ignored.
+- Each line can be either:
+  - `owner/name<TAB>clone_url` (what `--export-list` writes), or
+  - just `owner/name` (the script will resolve the URL at runtime).
+
 Clone all repos into `~/code` using SSH:
 
 ```bash
