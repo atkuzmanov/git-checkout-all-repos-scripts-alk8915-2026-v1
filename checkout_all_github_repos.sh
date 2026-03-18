@@ -118,22 +118,33 @@ fi
 
 run mkdir -p "$DEST"
 
-TMP_JSON="$(mktemp)"
-cleanup() { rm -f "$TMP_JSON"; }
-trap cleanup EXIT
-
 get_filtered_repo_lines() {
+  if [[ "$DRY_RUN" == "true" ]]; then
+    return 0
+  fi
   # Pull all repos for owner (user or org), then filter locally.
-  run gh repo list "$OWNER" --limit 100000 --json nameWithOwner,sshUrl,cloneUrl,isFork,isArchived,isPrivate --jq '.' >"$TMP_JSON"
-  python3 - "$PROTOCOL" "$VISIBILITY" "$INCLUDE_FORKS" "$INCLUDE_ARCHIVED" <"$TMP_JSON" <<'PY'
+  # Note: gh's available --json fields vary by version. We stick to broadly-supported ones.
+  # For HTTPS cloning, we derive the clone URL from the web URL by appending ".git".
+  gh repo list "$OWNER" --limit 100000 --json nameWithOwner,sshUrl,url,isFork,isArchived,isPrivate --jq '.' | \
+  python3 -c '
 import json, sys
-
 protocol = sys.argv[1]
 visibility = sys.argv[2]
 include_forks = sys.argv[3].lower() == "true"
 include_archived = sys.argv[4].lower() == "true"
 
-repos = json.load(sys.stdin)
+raw = sys.stdin.read()
+raw = raw.strip()
+# Robust parsing: sometimes gh may emit extra non-JSON text; extract the first JSON array.
+payload = raw
+start = raw.find("[")
+end = raw.rfind("]")
+if start != -1 and end != -1 and end > start:
+    payload = raw[start : end + 1]
+try:
+    repos = json.loads(payload) if payload else []
+except Exception:
+    repos = []
 for r in repos:
     if not include_forks and r.get("isFork"):
         continue
@@ -143,11 +154,15 @@ for r in repos:
         continue
     if visibility == "public" and r.get("isPrivate"):
         continue
-    url = r.get("sshUrl") if protocol == "ssh" else r.get("cloneUrl")
+    if protocol == "ssh":
+        url = r.get("sshUrl")
+    else:
+        web = r.get("url")
+        url = (web + ".git") if (web and not web.endswith(".git")) else web
     name = r.get("nameWithOwner")
     if url and name:
         print(f"{name}\t{url}")
-PY
+' "$PROTOCOL" "$VISIBILITY" "$INCLUDE_FORKS" "$INCLUDE_ARCHIVED"
 }
 
 resolve_url_for_name() {
@@ -180,23 +195,130 @@ if [[ -n "$EXPORT_LIST" ]]; then
   if [[ -e "$EXPORT_LIST" && ! -f "$EXPORT_LIST" ]]; then
     fail "--export-list path exists and is not a file: $EXPORT_LIST"
   fi
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[dry-run] Would query repos for owner '$OWNER' and write list to: $EXPORT_LIST"
+    exit 0
+  fi
+  EXPORT_LIST_ABS="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$EXPORT_LIST" 2>/dev/null || echo "$EXPORT_LIST")"
   readarray -t LINES < <(get_filtered_repo_lines)
+  # Keep only valid exported entries: owner/name<TAB>url
+  filtered=()
+  for l in "${LINES[@]}"; do
+    if [[ "$l" == *$'\t'* ]]; then
+      name="${l%%$'\t'*}"
+      url="${l#*$'\t'}"
+      if [[ "$name" == */* && "$url" == *github.com* ]]; then
+        filtered+=("$l")
+      fi
+    fi
+  done
+  LINES=("${filtered[@]}")
+
+  # Safety: make sure the repo containing this script is present in the export.
+  # This avoids any edge cases where the first JSON element might be dropped.
+  SCRIPT_REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  SCRIPT_REPO_NAME="$(basename "$SCRIPT_REPO_DIR")"
+  SELF_NAME="${OWNER}/${SCRIPT_REPO_NAME}"
+  SELF_LINE=""
+  if [[ "$PROTOCOL" == "ssh" ]]; then
+    TAB=$'\t'
+    SELF_LINE="${SELF_NAME}${TAB}git@github.com:${SELF_NAME}.git"
+  else
+    TAB=$'\t'
+    SELF_LINE="${SELF_NAME}${TAB}https://github.com/${SELF_NAME}.git"
+  fi
+  has_self=false
+  for l in "${LINES[@]}"; do
+    # Export lines should either be "owner/name<TAB>url" or "owner/name"
+    if [[ "$l" == "${SELF_NAME}" || "$l" == "${SELF_NAME}"$'\t'* ]]; then
+      has_self=true
+      break
+    fi
+  done
+  if [[ "$has_self" != "true" ]]; then
+    LINES+=("$SELF_LINE")
+  fi
   if [[ "${#LINES[@]}" -eq 0 ]]; then
     echo "No repositories matched the selected filters for owner '$OWNER'."
     exit 0
   fi
-  if [[ "$DRY_RUN" == "true" ]]; then
-    echo "[dry-run] Would write ${#LINES[@]} repos to: $EXPORT_LIST"
-    exit 0
+
+  # Final strict filter right before writing:
+  # keep ONLY lines in the form "owner/name<TAB>github-url".
+  strict=()
+  for l in "${LINES[@]}"; do
+    if [[ "$l" == *$'\t'* ]]; then
+      name="${l%%$'\t'*}"
+      url="${l#*$'\t'*}"
+      if [[ "$name" == */* ]]; then
+        if [[ "$PROTOCOL" == "ssh" && "$url" == git@github.com:* ]]; then
+          strict+=("$l")
+        elif [[ "$PROTOCOL" == "https" && "$url" == https://github.com/* ]]; then
+          strict+=("$l")
+        fi
+      fi
+    fi
+  done
+  LINES=("${strict[@]}")
+
+  if [[ "${#LINES[@]}" -eq 0 ]]; then
+    fail "Export produced no valid repo entries (owner='$OWNER', protocol='$PROTOCOL')."
   fi
   mkdir -p "$(dirname "$EXPORT_LIST")"
+  # Determinism guard: after writing the file, ensure the script's own repo is present.
+  # (This prevents any edge-case where an export parse drops the first element.)
   {
     echo "# Repo list (editable). One per line."
     echo "# Format: owner/name<TAB>clone_url"
     echo "# You can also delete the URL column and leave just owner/name (script will resolve URL at runtime)."
     printf '%s\n' "${LINES[@]}"
   } >"$EXPORT_LIST"
-  echo "Wrote repo list: $EXPORT_LIST"
+
+  # Final scrub: remove any non-matching lines (e.g. stray "56") to make export deterministic.
+  python3 - "$EXPORT_LIST" "$SELF_NAME" "$SELF_LINE" <<'PY'
+import re, sys
+
+path = sys.argv[1]
+self_name = sys.argv[2]
+self_line = sys.argv[3]
+
+tab_line_re = re.compile(r"^[^#\s]+/[^#\s]+\t.+$")
+github_url_re = re.compile(r"github\.com[:/]")
+
+out_lines = []
+present = False
+
+with open(path, "r", encoding="utf-8") as f:
+    for raw in f:
+        line = raw.rstrip("\n")
+        if not line:
+            continue
+        if line.startswith("#"):
+            out_lines.append(line)
+            continue
+
+        # Allow either:
+        #   owner/name<TAB>url   (preferred)
+        #   owner/name           (supported by --from-list)
+        if "\t" in line:
+            if tab_line_re.match(line) and github_url_re.search(line):
+                out_lines.append(line)
+                if line.startswith(self_name + "\t"):
+                    present = True
+        else:
+            if line == self_name:
+                present = True
+                out_lines.append(line)
+            # Drop everything else (including stray "56")
+
+if not present and self_line:
+    out_lines.append(self_line)
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write("\n".join(out_lines) + "\n")
+PY
+
+  echo "Wrote repo list: $EXPORT_LIST_ABS"
   exit 0
 fi
 
@@ -205,6 +327,24 @@ if [[ -n "$FROM_LIST" ]]; then
 else
   readarray -t LINES < <(get_filtered_repo_lines)
 fi
+
+ # Keep only valid curated entries:
+ # - owner/name<TAB>url
+ # - or owner/name
+filtered=()
+for l in "${LINES[@]}"; do
+  if [[ "$l" == *$'\t'* ]]; then
+    name="${l%%$'\t'*}"
+    if [[ "$name" == */* ]]; then
+      filtered+=("$l")
+    fi
+  else
+    if [[ "$l" == */* ]]; then
+      filtered+=("$l")
+    fi
+  fi
+done
+LINES=("${filtered[@]}")
 
 if [[ "${#LINES[@]}" -eq 0 ]]; then
   if [[ -n "$FROM_LIST" ]]; then
@@ -247,8 +387,8 @@ do_one() {
   fi
 }
 
-export -f do_one fail need_cmd run
-export DEST UPDATE_EXISTING SHALLOW DRY_RUN
+export -f do_one fail need_cmd run resolve_url_for_name
+export DEST UPDATE_EXISTING SHALLOW DRY_RUN PROTOCOL
 
 if [[ "$PARALLEL" -eq 1 ]]; then
   for line in "${LINES[@]}"; do
